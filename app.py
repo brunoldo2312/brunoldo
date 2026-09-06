@@ -1,0 +1,186 @@
+import hashlib
+import time
+import json
+import sqlite3
+import os
+import sys
+import secrets
+from flask import Flask, jsonify, request, render_template_string
+
+# =====================================================================
+# CONFIGURAÇÕES GLOBAIS DA CRIPTOMOEDA BRUNO
+# =====================================================================
+COIN_NAME = "Bruno"
+COIN_SYMBOL = "BRN"
+TX_EXTRA_BRUNO_MEMO_TAG = 0xBB
+DIFFICULTY = 4 
+
+class BrunoWallet:
+    def __init__(self):
+        self.spend_secret_key = ""
+        self.spend_public_key = ""
+        self.view_secret_key = ""
+        self.view_public_key = ""
+        self.address = ""
+
+    def generate_new_wallet(self):
+        self.spend_secret_key = secrets.token_hex(32)
+        self.view_secret_key = secrets.token_hex(32)
+        
+        self.spend_public_key = hashlib.sha256(self.spend_secret_key.encode()).hexdigest()
+        self.view_public_key = hashlib.sha256(self.view_secret_key.encode()).hexdigest()
+        
+        prefixo_brn = "brn1"
+        dados_brutos_endereco = f"{prefixo_brn}{self.spend_public_key}{self.view_public_key}"
+        checksum = hashlib.sha256(dados_brutos_endereco.encode()).hexdigest()[:8]
+        
+        self.address = f"{dados_brutos_endereco}{checksum}"
+        return self.to_dict()
+
+    def to_dict(self):
+        return {
+            "address": self.address,
+            "spend_secret_key": self.spend_secret_key,
+            "spend_public_key": self.spend_public_key,
+            "view_secret_key": self.view_secret_key,
+            "view_public_key": self.view_public_key
+        }
+
+class BrunoMemoProgram:
+    def __init__(self, user_name: str = "", message: str = ""):
+        self.user_name = user_name
+        self.message = message
+
+    def serialize(self) -> str:
+        tag_hex = f"{TX_EXTRA_BRUNO_MEMO_TAG:02x}"
+        name_bytes = self.user_name.encode('utf-8')
+        msg_bytes = self.message.encode('utf-8')
+        return tag_hex + f"{len(name_bytes):02x}" + name_bytes.hex() + f"{len(msg_bytes):02x}" + msg_bytes.hex()
+
+    @classmethod
+    def deserialize(cls, tx_extra_hex: str):
+        try:
+            if not tx_extra_hex.startswith(f"{TX_EXTRA_BRUNO_MEMO_TAG:02x}"): return None
+            ptr = 2
+            name_len = int(tx_extra_hex[ptr:ptr+2], 16)
+            ptr += 2
+            name = bytes.fromhex(tx_extra_hex[ptr:ptr+(name_len*2)]).decode('utf-8')
+            ptr += name_len * 2
+            msg_len = int(tx_extra_hex[ptr:ptr+2], 16)
+            ptr += 2
+            msg = bytes.fromhex(tx_extra_hex[ptr:ptr+(msg_len*2)]).decode('utf-8')
+            return cls(user_name=name, message=msg)
+        except: return None
+
+class BrunoBlock:
+    def __init__(self, index, previous_hash, transactions, tx_extra, timestamp=None, nonce=0, block_hash=None):
+        self.index = index
+        self.timestamp = timestamp if timestamp else time.time()
+        self.previous_hash = previous_hash
+        self.transactions = transactions if isinstance(transactions, list) else json.loads(transactions)
+        self.tx_extra = tx_extra
+        self.nonce = nonce
+        self.hash = block_hash if block_hash else self.calculate_hash()
+
+    def calculate_hash(self) -> str:
+        block_string = json.dumps({
+            "index": self.index, "timestamp": self.timestamp, "previous_hash": self.previous_hash,
+            "transactions": self.transactions, "tx_extra": self.tx_extra, "nonce": self.nonce
+        }, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+
+    def mine_block(self):
+        target = "0" * DIFFICULTY
+        while self.hash[:DIFFICULTY] != target:
+            self.nonce += 1
+            self.hash = self.calculate_hash()
+
+    def to_dict(self):
+        return {
+            "index": self.index, "timestamp": self.timestamp, "previous_hash": self.previous_hash,
+            "transactions": self.transactions, "tx_extra": self.tx_extra, "nonce": self.nonce, "hash": self.hash
+        }
+
+class RealBrunoBlockchain:
+    def __init__(self, port):
+        self.port = port
+        self.db_path = f"blockchain_node_{port}.db"
+        self.init_database()
+
+    def init_database(self):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS blocks (
+                    id_index INTEGER PRIMARY KEY, timestamp REAL, previous_hash TEXT,
+                    transactions TEXT, tx_extra TEXT, nonce INTEGER, hash TEXT
+                )
+            ''')
+            cursor.execute('SELECT COUNT(*) FROM blocks')
+            if cursor.fetchone()[0] == 0:
+                memo_genesis = BrunoMemoProgram("Bruno", "Bloco Genesis Ativo.")
+                genesis_txs = [{"sender": "SYSTEM", "recipient": "brn1_genesis_pool", "amount": 1000000.0}]
+                genesis_block = BrunoBlock(0, "0", genesis_txs, memo_genesis.serialize())
+                genesis_block.mine_block()
+                
+                cursor.execute('''
+                    INSERT OR REPLACE INTO blocks (id_index, timestamp, previous_hash, transactions, tx_extra, nonce, hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (genesis_block.index, genesis_block.timestamp, genesis_block.previous_hash, json.dumps(genesis_block.transactions), genesis_block.tx_extra, genesis_block.nonce, genesis_block.hash))
+                conn.commit()
+
+    def save_block_to_db(self, block):
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO blocks (id_index, timestamp, previous_hash, transactions, tx_extra, nonce, hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (block.index, block.timestamp, block.previous_hash, json.dumps(block.transactions), block.tx_extra, block.nonce, block.hash))
+            conn.commit()
+
+    def get_latest_block(self) -> BrunoBlock:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id_index, previous_hash, transactions, tx_extra, timestamp, nonce, hash FROM blocks ORDER BY id_index DESC LIMIT 1')
+            row = cursor.fetchone()
+            if row:
+                return BrunoBlock(index=row[0], previous_hash=row[1], transactions=json.loads(row[2]), tx_extra=row[3], timestamp=row[4], nonce=row[5], block_hash=row[6])
+            
+            memo_genesis = BrunoMemoProgram("Bruno", "Bloco Genesis Ativo.")
+            return BrunoBlock(0, "0", [{"sender": "SYSTEM", "recipient": "brn1_genesis_pool", "amount": 1000000.0}], memo_genesis.serialize())
+
+    def get_full_chain(self):
+        chain = []
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id_index, previous_hash, transactions, tx_extra, timestamp, nonce, hash FROM blocks ORDER BY id_index ASC')
+            for row in cursor.fetchall():
+                chain.append(BrunoBlock(index=row[0], previous_hash=row[1], transactions=json.loads(row[2]), tx_extra=row[3], timestamp=row[4], nonce=row[5], block_hash=row[6]).to_dict())
+        return chain
+
+    def get_balances(self):
+        balances = {}
+        for b in self.get_full_chain():
+            for tx in b['transactions']:
+                if isinstance(tx, dict):
+                    sender = tx.get('sender')
+                    recipient = tx.get('recipient')
+                    amount = float(tx.get('amount', 0))
+                    
+                    if sender and sender != "SYSTEM":
+                        balances[sender] = balances.get(sender, 0.0) - amount
+                    if recipient:
+                        balances[recipient] = balances.get(recipient, 0.0) + amount
+        return balances
+
+    def create_and_mine_block(self, author_name, memo_text, transactions):
+        latest = self.get_latest_block()
+        memo = BrunoMemoProgram(author_name, memo_text)
+        new_block = BrunoBlock(latest.index + 1, latest.hash, transactions, memo.serialize())
+        new_block.mine_block()
+        self.save_block_to_db(new_block)
+        return new_block
+
+# =====================================================================
+# INTERFACE GRÁFICA INTERNA (STRING CONCATENADA PARA PREVENIR ERROS)
+# =====================================================================
