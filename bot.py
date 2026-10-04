@@ -1,40 +1,31 @@
 import os
-import re
+import json
 import time
 import logging
 import schedule
 import tweepy
 import google.generativeai as genai
-from datetime import datetime
-from dotenv import load_dotenv  # pip install python-dotenv
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright
 
 # ==========================================================
 # 📂 CARREGAR VARIÁVEIS DE AMBIENTE
 # ==========================================================
 load_dotenv()
 
-# ==========================================================
-# 🔑 CHAVES DO X (do .env)
-# ==========================================================
 API_KEY             = os.getenv("X_API_KEY")
 API_SECRET          = os.getenv("X_API_SECRET")
 ACCESS_TOKEN        = os.getenv("X_ACCESS_TOKEN")
 ACCESS_TOKEN_SECRET = os.getenv("X_ACCESS_TOKEN_SECRET")
+GEMINI_KEY          = os.getenv("GEMINI_KEY")
 
 # ==========================================================
-# 🤖 CHAVE DO GEMINI (do .env)
-# ==========================================================
-GEMINI_KEY = os.getenv("GEMINI_KEY")
-
-# ==========================================================
-# 🌐 CONFIGURAÇÕES DO PROJETO
+# 🌐 CONFIGURAÇÕES
 # ==========================================================
 URL_MURAL = "https://brunoldo2312.github.io/brn-site/"
 MAX_TWEET_LENGTH = 280
 MAX_REPLY_LENGTH = 240
-
-# Arquivo para persistir o ID da última menção respondida
-ARQUIVO_ULTIMA_MENCAO = "ultima_mencao.txt"
+ARQUIVO_ESTADO = "estado_bot.json"
 
 # ==========================================================
 # 📝 LOGS
@@ -46,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==========================================================
-# 🤖 INICIALIZAR GEMINI
+# 🤖 GEMINI
 # ==========================================================
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
@@ -77,17 +68,20 @@ REGRAS:
 """
 
 # ==========================================================
-# 🔐 AUTENTICAÇÃO NO X
+# 🔐 ESTADO GLOBAL
 # ==========================================================
 MEU_USERNAME = None
 MEU_USER_ID = None
 client = None
+ordens_vistas = set()
+ultima_mencao_id = None
+contador_post = 0
 
-
+# ==========================================================
+# 🔑 AUTENTICAÇÃO NO X
+# ==========================================================
 def inicializar_x() -> bool:
-    """Inicializa conexão com a API v2 do X."""
     global MEU_USERNAME, MEU_USER_ID, client
-
     try:
         if not all([API_KEY, API_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET]):
             logger.error("❌ Chaves da API do X não configuradas no .env!")
@@ -105,71 +99,108 @@ def inicializar_x() -> bool:
         MEU_USER_ID = me.data.id
         logger.info(f"✅ Autenticado como @{MEU_USERNAME} (ID: {MEU_USER_ID})")
         return True
-
     except Exception as e:
         logger.error(f"❌ Erro na autenticação do X: {e}")
         return False
 
 # ==========================================================
-# 📦 ESTADO GLOBAL
+# 💾 PERSISTÊNCIA DE ESTADO
 # ==========================================================
-ordens_vistas = set()
-ultima_mencao_id = None
-contador_post = 0
-
-# ==========================================================
-# 💾 PERSISTÊNCIA: ÚLTIMA MENÇÃO
-# ==========================================================
-def salvar_ultima_mencao(tweet_id):
+def salvar_estado():
     try:
-        with open(ARQUIVO_ULTIMA_MENCAO, "w") as f:
-            f.write(str(tweet_id))
+        dados = {
+            "ultima_mencao_id": ultima_mencao_id,
+            "ordens_vistas": list(ordens_vistas),
+            "contador_post": contador_post,
+        }
+        with open(ARQUIVO_ESTADO, "w", encoding="utf-8") as f:
+            json.dump(dados, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning(f"⚠️ Não foi possível salvar última menção: {e}")
+        logger.warning(f"⚠️ Não foi possível salvar o estado: {e}")
 
 
-def carregar_ultima_mencao():
+def carregar_estado():
+    global ultima_mencao_id, ordens_vistas, contador_post
+
+    if not os.path.exists(ARQUIVO_ESTADO):
+        logger.info("ℹ️ Nenhum arquivo de estado. Iniciando do zero.")
+        return
+
     try:
-        with open(ARQUIVO_ULTIMA_MENCAO, "r") as f:
-            return int(f.read().strip())
-    except Exception:
-        return None
+        with open(ARQUIVO_ESTADO, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+            ultima_mencao_id = dados.get("ultima_mencao_id")
+            ordens_vistas = set(dados.get("ordens_vistas", []))
+            contador_post = dados.get("contador_post", 0)
+            logger.info(
+                f"💾 Estado restaurado: {len(ordens_vistas)} ordens | "
+                f"última menção: {ultima_mencao_id} | post #{contador_post}"
+            )
+    except Exception as e:
+        logger.warning(f"⚠️ Erro ao carregar estado: {e}")
 
 # ==========================================================
-# 📝 FUNÇÃO: POSTAR TEXTO
+# 📝 POSTAR (com retry + backoff exponencial)
 # ==========================================================
-def postar(texto: str) -> bool:
-    """Posta um tweet. Retorna True se der certo."""
+def postar(texto: str, tentativas: int = 3) -> bool:
     if not client:
         logger.error("❌ Cliente do X não inicializado")
         return False
 
-    try:
-        if len(texto) > MAX_TWEET_LENGTH:
-            texto = texto[:MAX_TWEET_LENGTH - 3] + "..."
+    if len(texto) > MAX_TWEET_LENGTH:
+        texto = texto[:MAX_TWEET_LENGTH - 3] + "..."
 
-        response = client.create_tweet(text=texto)
-        tweet_id = response.data["id"]
-        logger.info(f"✅ Postado (ID: {tweet_id}): {texto[:60]}...")
-        return True
+    for tentativa in range(1, tentativas + 1):
+        try:
+            response = client.create_tweet(text=texto)
+            tweet_id = response.data["id"]
+            logger.info(f"✅ Postado (ID: {tweet_id}): {texto[:60]}...")
+            return True
 
-    except tweepy.TweepyException as e:
-        if "429" in str(e):
-            logger.warning("⚠️ Limite de taxa atingido! Esperando 60s...")
-            time.sleep(60)
-        logger.error(f"❌ Erro ao postar: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"❌ Erro inesperado ao postar: {e}")
-        return False
+        except tweepy.TweepyException as e:
+            erro_str = str(e)
+
+            # Conta suspensa/bloqueada
+            if "403" in erro_str or "suspended" in erro_str.lower():
+                logger.critical("🚨 CONTA BLOQUEADA/SUSPENSA NO X!")
+                return False
+
+            # Rate limit — backoff exponencial
+            if "429" in erro_str:
+                espera = 60 * tentativa
+                logger.warning(
+                    f"⚠️ Rate limit! Tentativa {tentativa}/{tentativas}. "
+                    f"Aguardando {espera}s..."
+                )
+                time.sleep(espera)
+                continue
+
+            # Tweet duplicado
+            if "duplicate" in erro_str.lower() or "187" in erro_str:
+                logger.warning("⚠️ Tweet duplicado, pulando.")
+                return False
+
+            logger.error(f"❌ Erro ao postar (tentativa {tentativa}): {e}")
+            return False
+
+        except Exception as e:
+            logger.error(f"❌ Erro inesperado: {e}")
+            return False
+
+    logger.error(f"❌ Falha após {tentativas} tentativas.")
+    return False
 
 # ==========================================================
-# 🧠 FUNÇÃO: GERAR POST COM GEMINI
+# 🧠 GERAR POST COM GEMINI
 # ==========================================================
 def gerar_post(tema: str) -> str:
-    """Gera um tweet usando IA."""
+    fallback = (
+        f"📢 BRN — Negocie cripto P2P direto na carteira! "
+        f"Sem intermediários, seguro com escrow on-chain.\n🔗 {URL_MURAL}"
+    )
+
     if not model_gemini:
-        return f"📢 BRN — Negocie cripto P2P direto na carteira! Sem intermediários, seguro com escrow on-chain.\n🔗 {URL_MURAL}"
+        return fallback
 
     prompt = (
         f"{CONTEXTO_BRN}\n\n"
@@ -182,6 +213,9 @@ def gerar_post(tema: str) -> str:
 
     try:
         response = model_gemini.generate_content(prompt)
+        if not response or not response.text:
+            return fallback
+
         texto = response.text.strip().strip('"').strip("'")
 
         if URL_MURAL not in texto:
@@ -191,13 +225,12 @@ def gerar_post(tema: str) -> str:
             texto = texto[:MAX_TWEET_LENGTH - 3 - len(URL_MURAL)] + "...\n" + URL_MURAL
 
         return texto
-
     except Exception as e:
         logger.error(f"❌ Erro Gemini: {e}")
-        return f"📢 BRN — Negocie cripto P2P direto na carteira! Sem intermediários, seguro com escrow on-chain.\n🔗 {URL_MURAL}"
+        return fallback
 
 # ==========================================================
-# ⏰ FUNÇÃO: POST DIÁRIO
+# ⏰ POST DIÁRIO
 # ==========================================================
 TEMAS = [
     "Como negociar cripto direto na carteira sem intermediários",
@@ -208,109 +241,98 @@ TEMAS = [
     "BRN: sua chave, seus tokens — negocie P2P com total soberania",
 ]
 
-
 def post_diario():
-    """Posta um tema rotativo."""
     global contador_post
     tema = TEMAS[contador_post % len(TEMAS)]
     contador_post += 1
+    salvar_estado()
 
     logger.info(f"📝 Gerando post sobre: {tema[:40]}...")
     texto = gerar_post(tema)
     postar(texto)
 
 # ==========================================================
-# 🔍 FUNÇÃO: VERIFICAR MURAL (SELETORES CORRETOS)
+# 🔍 VERIFICAR MURAL
 # ==========================================================
-def verificar_mural():
-    """Verifica o mural BRN e posta novas ordens."""
-    from playwright.sync_api import sync_playwright
+def verificar_mural(browser):
+    if not browser or not browser.is_connected():
+        logger.error("❌ Chromium não está disponível.")
+        return
+
+    context = browser.new_context()
+    page = context.new_page()
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+        page.route(
+            "**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ico,css}",
+            lambda r: r.abort()
+        )
+        page.route("**/*analytics*", lambda r: r.abort())
+        page.route("**/*tracker*", lambda r: r.abort())
 
-            # Bloqueia recursos desnecessários (mais rápido)
-            page.route(
-                "**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ico}",
-                lambda r: r.abort()
+        logger.info(f"🌐 Acessando mural: {URL_MURAL}")
+        page.goto(URL_MURAL, wait_until="domcontentloaded", timeout=30000)
+
+        try:
+            page.wait_for_selector(
+                "#orders > .order, #orders > .empty",
+                timeout=20000
             )
-            page.route("**/*analytics*", lambda r: r.abort())
-            page.route("**/*tracker*", lambda r: r.abort())
+        except Exception:
+            logger.warning("⚠️ Timeout esperando ordens renderizarem.")
+            return
 
-            logger.info(f"🌐 Acessando mural: {URL_MURAL}")
-            page.goto(URL_MURAL, wait_until="domcontentloaded", timeout=30000)
+        ordens = page.query_selector_all("#orders > .order")
 
-            # Espera o JS renderizar (seletor correto do app.js)
-            try:
-                page.wait_for_selector(
-                    "#orders > .order, #orders > .empty",
-                    timeout=20000
-                )
-            except Exception:
-                logger.warning("⚠️ Timeout esperando ordens renderizarem.")
-                browser.close()
-                return
+        if not ordens:
+            logger.info("ℹ️ Nenhuma ordem encontrada no mural.")
+            return
 
-            ordens = page.query_selector_all("#orders > .order")
+        logger.info(f"📋 {len(ordens)} ordem(ns) encontrada(s).")
 
-            if not ordens:
-                logger.info("ℹ️ Nenhuma ordem encontrada no mural.")
-                browser.close()
-                return
+        for ordem in ordens:
+            num_el = ordem.query_selector(".order-num")
+            tag_el = ordem.query_selector(".tag")
+            swap_sides = ordem.query_selector_all(".swap-side")
 
-            logger.info(f"📋 {len(ordens)} ordem(ns) encontrada(s).")
+            num = num_el.inner_text().strip() if num_el else "#?"
+            status = tag_el.inner_text().strip() if tag_el else ""
 
-            for ordem in ordens:
-                num_el = ordem.query_selector(".order-num")
-                tag_el = ordem.query_selector(".tag")
-                swap_sides = ordem.query_selector_all(".swap-side")
+            oferece = ""
+            pede = ""
+            if len(swap_sides) >= 2:
+                oferece = swap_sides[0].inner_text().strip().replace("\n", " ")
+                pede = swap_sides[1].inner_text().strip().replace("\n", " ")
 
-                num = num_el.inner_text().strip() if num_el else "#?"
-                status = tag_el.inner_text().strip() if tag_el else ""
+            chave = f"{num}|{oferece}|{pede}"
+            if chave in ordens_vistas:
+                continue
+            ordens_vistas.add(chave)
 
-                oferece = ""
-                pede = ""
-                if len(swap_sides) >= 2:
-                    oferece = swap_sides[0].inner_text().strip().replace("\n", " ")
-                    pede = swap_sides[1].inner_text().strip().replace("\n", " ")
+            if "Executada" in status or "Cancelada" in status:
+                continue
 
-                chave = f"{num}|{oferece}|{pede}"
-                if chave in ordens_vistas:
-                    continue
-                ordens_vistas.add(chave)
-
-                # Só posta ordens ativas
-                if "Executada" in status or "Cancelada" in status:
-                    continue
-
-                texto = (
-                    f"🆕 Nova ordem ativa no mural BRN!\n\n"
-                    f"{num} — {status}\n"
-                    f"🔹 Oferece: {oferece}\n"
-                    f"🔸 Pede: {pede}\n\n"
-                    f"🔗 Confira: {URL_MURAL}"
-                )
-                postar(texto)
-                time.sleep(5)  # respeita rate limit
-
-            browser.close()
+            texto = (
+                f"🆕 Nova ordem ativa no mural BRN!\n\n"
+                f"{num} — {status}\n"
+                f"🔹 Oferece: {oferece}\n"
+                f"🔸 Pede: {pede}\n\n"
+                f"🔗 Confira: {URL_MURAL}"
+            )
+            postar(texto)
+            time.sleep(5)
 
     except Exception as e:
         logger.error(f"❌ Erro ao verificar mural: {e}")
+    finally:
+        salvar_estado()
+        context.close()
 
 # ==========================================================
-# 💬 FUNÇÃO: RESPONDER MENÇÕES
+# 💬 RESPONDER MENÇÕES
 # ==========================================================
 def responder_mencao(tweet_id: str, texto_pergunta: str, autor: str):
-    """Gera e publica uma resposta a uma menção usando API v2."""
-
-    if not texto_pergunta.strip():
-        return
-
-    if not model_gemini:
-        logger.warning("⚠️ Gemini indisponível, pulando resposta.")
+    if not texto_pergunta.strip() or not model_gemini:
         return
 
     prompt = (
@@ -321,24 +343,33 @@ def responder_mencao(tweet_id: str, texto_pergunta: str, autor: str):
 
     try:
         response = model_gemini.generate_content(prompt)
-        resposta = response.text.strip()
+        if not response or not response.text:
+            return
 
+        resposta = response.text.strip()
         if len(resposta) > MAX_REPLY_LENGTH:
             resposta = resposta[:MAX_REPLY_LENGTH - 3] + "..."
 
         resposta_final = f"@{autor} {resposta}"
-
         client.create_tweet(text=resposta_final, in_reply_to_tweet_id=tweet_id)
         logger.info(f"💬 Respondido @{autor}: {texto_pergunta[:45]}...")
 
-    except Exception as e:
+    except tweepy.TweepyException as e:
+        erro_str = str(e)
+        if "403" in erro_str or "suspended" in erro_str.lower():
+            logger.critical("🚨 CONTA BLOQUEADA/SUSPENSA NO X!")
+            return
+        if "429" in erro_str:
+            logger.warning("⚠️ Rate limit em resposta. Aguardando 60s...")
+            time.sleep(60)
+            return
         logger.error(f"❌ Erro ao responder: {e}")
+    except Exception as e:
+        logger.error(f"❌ Erro inesperado: {e}")
 
 
 def verificar_mencoes():
-    """Verifica menções usando API v2."""
     global ultima_mencao_id
-
     if not client:
         return
 
@@ -359,11 +390,10 @@ def verificar_mencoes():
             return
 
         usuarios = {u.id: u.username for u in resposta.includes.get("users", [])}
+        processou = False
 
         for tweet in reversed(resposta.data):
             autor_username = usuarios.get(tweet.author_id, "desconhecido")
-
-            # Remove menção ao bot
             texto_limpo = " ".join(
                 w for w in tweet.text.split()
                 if w.lower() != f"@{MEU_USERNAME}".lower()
@@ -373,8 +403,11 @@ def verificar_mencoes():
             responder_mencao(tweet.id, texto_limpo, autor_username)
 
             ultima_mencao_id = tweet.id
-            salvar_ultima_mencao(tweet.id)
+            processou = True
             time.sleep(3)
+
+        if processou:
+            salvar_estado()
 
     except Exception as e:
         logger.error(f"❌ Erro ao verificar menções: {e}")
@@ -382,17 +415,15 @@ def verificar_mencoes():
 # ==========================================================
 # 📅 AGENDAMENTOS
 # ==========================================================
-def agendar_tudo():
+def agendar_tudo(browser):
     schedule.clear()
 
-    # 4 posts diários
     schedule.every().day.at("09:00").do(post_diario)
     schedule.every().day.at("12:00").do(post_diario)
     schedule.every().day.at("15:00").do(post_diario)
     schedule.every().day.at("18:00").do(post_diario)
 
-    # Verificações periódicas
-    schedule.every(45).minutes.do(verificar_mural)
+    schedule.every(45).minutes.do(verificar_mural, browser=browser)
     schedule.every(8).minutes.do(verificar_mencoes)
 
     logger.info("✅ Agendamentos configurados:")
@@ -401,40 +432,67 @@ def agendar_tudo():
     logger.info("   • Verificar menções: a cada 8 min")
 
 # ==========================================================
-# 🚀 MAIN
+# 🚀 MAIN (com auto-recovery do Chromium)
 # ==========================================================
 def main():
-    global ultima_mencao_id
+    logger.info("🤖 Bot BRN (X) — modo produção")
 
-    logger.info("🤖 Bot BRN (X) iniciando...")
-
-    # Validações
     if not GEMINI_KEY:
         logger.critical("⛔ GEMINI_KEY não configurada no .env")
         return
 
     if not inicializar_x():
-        logger.critical("⛔ Falha na inicialização. Encerrando.")
+        logger.critical("⛔ Falha na inicialização do X. Encerrando.")
         return
 
-    # Carrega última menção vista
-    ultima_mencao_id = carregar_ultima_mencao()
-    if ultima_mencao_id:
-        logger.info(f"💾 Retomando do ID de menção: {ultima_mencao_id}")
+    carregar_estado()
 
-    agendar_tudo()
+    with sync_playwright() as p:
+        def novo_browser():
+            logger.info("🚀 Inicializando Chromium...")
+            return p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ]
+            )
 
-    # Loop principal
-    while True:
+        browser = novo_browser()
+        agendar_tudo(browser)
+
         try:
-            schedule.run_pending()
-            time.sleep(15)
+            verificar_mural(browser)
+
+            while True:
+                schedule.run_pending()
+
+                # Auto-recovery do Chromium
+                if not browser.is_connected():
+                    logger.warning("⚠️ Chromium caiu! Reiniciando...")
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    browser = novo_browser()
+                    agendar_tudo(browser)
+                    logger.info("✅ Chromium reiniciado e agenda re-registrada.")
+
+                time.sleep(15)
+
         except KeyboardInterrupt:
-            logger.info("👋 Bot encerrado pelo usuário.")
-            break
+            logger.info("👋 Encerrado pelo usuário.")
         except Exception as e:
-            logger.error(f"❌ Erro no loop: {e}")
-            time.sleep(60)
+            logger.error(f"❌ Erro no loop principal: {e}")
+        finally:
+            logger.info("🧹 Salvando estado e fechando Chromium...")
+            salvar_estado()
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
